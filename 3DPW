@@ -1,0 +1,120 @@
+import pandas as pd  
+import numpy as np  
+  
+# Set constants  
+ncutoff = 20  #this is the number of carriers wanted per window
+genename = 'exampleGene'  
+  
+# Load data  
+dfall = pd.read_csv('example_gene_counts', delim_whitespace=True)  #processed from plink hardy command
+df3d = pd.read_csv('example_3dcoordinates', sep="\t")  #x y z coordinates of variants
+  
+# Merge dataframes and convert column types  
+dfall = dfall.merge(df3d[['ID','x','y','z']].drop_duplicates(), on='ID', how='inner')  
+dfall[['chr', 'pos', 'ref', 'alt']] = dfall['ID'].str.split(':', expand=True)  
+dfall[['pos', 'x', 'y', 'z']] = dfall[['pos', 'x', 'y', 'z']].astype({'pos': 'int', 'x': 'float', 'y': 'float', 'z': 'float'})  
+  
+# Calculate carrier counts
+dfall['carriers'] = np.where(dfall.HOM_A1_CT.astype(int)>dfall.TWO_AX_CT.astype(int), dfall.TWO_AX_CT.astype(int)*2+dfall.HET_A1_CT.astype(int), dfall.HET_A1_CT.astype(int)+dfall.HOM_A1_CT.astype(int)*2)  
+  
+# Separate variants based on carrier count  
+# dfsall has just the single variant windows
+dfsall = dfall[dfall.carriers >= ncutoff].sort_values(by=['pos']).reset_index(drop=True)  
+dfall = dfall[dfall.carriers < ncutoff]  
+dfall['totalcaratsite'] = dfall.groupby(['chr','pos']).carriers.transform(np.sum)  
+  
+# Separate variants based on total carriers per site  
+# dfmall has just the windows where all variants are at the same site
+dfmall = dfall[dfall.totalcaratsite >= ncutoff].sort_values(by=['chr','pos']).reset_index(drop=True)  
+# dfall has the remainder of the variants
+dfall = dfall[dfall.totalcaratsite < ncutoff].sort_values(by=['chr','pos']).reset_index(drop=True)  
+  
+# Filter for gene of interest  
+df = dfall[dfall.MANECT_gene == genename].reset_index(drop=True)  
+dfs = dfsall[dfsall.MANECT_gene == genename].reset_index(drop=True)  
+dfm = dfmall[dfmall.MANECT_gene == genename].reset_index(drop=True)  
+  
+# Initialize window dataframe  
+dfwindows = pd.DataFrame(columns = ['SNP', 'Window', 'carriers', 'solo_variant_window', 'pos', 'solo_site_window', 'distance'])  
+  
+# Initialize window counter  
+window = 0  
+  
+# Process windows with only one variant  
+for i in range(len(dfs)):  
+    dfwindows = dfwindows.append({  
+        'SNP' : dfs.ID[i],   
+        'Window' : f'{genename}_{ncutoff}_Window__{window}',  
+        'carriers' : dfs.carriers[i],  
+        'solo_variant_window' : 1,  
+        'pos' : dfs.pos[i],  
+        'solo_site_window' : 0,  
+        'distance' : 0  
+    }, ignore_index=True)  
+    window += 1  
+  
+# Process windows with only one position  
+for i in range(len(dfm)):  
+    dfwindows = dfwindows.append({  
+        'SNP' : dfm.ID[i],   
+        'Window' : f'{genename}_{ncutoff}_Window__{window}',  
+        'carriers' : dfm.carriers[i],  
+        'solo_variant_window' : 0,  
+        'pos' : dfm.pos[i],  
+        'solo_site_window' : 1,  
+        'distance' : 0  
+    }, ignore_index=True)  
+    window += 1 if i == len(dfm) - 1 or dfm.pos[i+1] != dfm.pos[i] else 0  
+  
+# Process windows with multiple sites  
+carriers = 0  
+for i in range(len(df)):  
+    # Append current variant to windows dataframe  
+    dfwindows = dfwindows.append({  
+        'SNP' : df.ID[i],  
+        'Window' : f'{genename}_{ncutoff}_Window__{window}',  
+        'carriers' : df.carriers[i],  
+        'solo_variant_window' : 0,  
+        'pos' : df.pos[i],  
+        'solo_site_window' : 0,  
+        'distance' : 0  
+    }, ignore_index=True)  
+  
+    # Build a window around each variant
+    # Start with the n carriers for that window the n carriers for the central variant
+    carriers += df.carriers[i]  
+  
+    # Create dataframe to compare distances to all other vairants 
+    dfcompare = df[df.ID != df.ID[i]].copy()  
+    dfcompare['x1'], dfcompare['y1'], dfcompare['z1'] = df.x[i], df.y[i], df.z[i]  
+    dfcompare['distance'] = np.sqrt((dfcompare.x1 - dfcompare.x)**2 + (dfcompare.y1 - dfcompare.y)**2 + (dfcompare.z1 - dfcompare.z)**2)  
+  
+    # Loop through other variants sorted by distance  to the central variant
+    dfcompare = dfcompare.sort_values('distance').reset_index(drop=True)  
+    for x in range(len(dfcompare)):  
+        # Append compared variant to windows dataframe  
+        dfwindows = dfwindows.append({  
+            'SNP' : dfcompare.ID[x],  
+            'Window' : f'{genename}_{ncutoff}_Window__{window}',  
+            'carriers' : dfcompare.carriers[x],  
+            'solo_variant_window' : 0,  
+            'pos' : dfcompare.pos[x],  
+            'solo_site_window' : 0,  
+            'distance' : dfcompare.distance[x]  
+        }, ignore_index=True)  
+  
+        # Update total carriers for current window  
+        carriers += dfcompare.carriers[x]  
+  
+        # If total carriers for current window reached cutoff, reset carriers and increment window  
+        if carriers >= ncutoff:  
+            carriers = 0  
+            window += 1  
+            break  
+  
+# Calculate total carriers per window and sort windows dataframe by position  
+dfwindows['carriers_in_window'] = dfwindows.groupby('Window').carriers.transform(np.sum)  
+dfwindows = dfwindows.sort_values(by='pos').reset_index(drop=True)  
+  
+# Write windows dataframe to file  
+dfwindows.to_csv('exampleGene_3DPW.txt', sep="\t", index=False)  
